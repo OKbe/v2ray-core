@@ -1,12 +1,12 @@
-package retry
+package retry_test
 
 import (
-	"errors"
 	"testing"
 	"time"
 
-	v2testing "github.com/v2ray/v2ray-core/testing"
-	"github.com/v2ray/v2ray-core/testing/assert"
+	"v2ray.com/core/common/errors"
+	. "v2ray.com/core/common/retry"
+	"v2ray.com/core/testing/assert"
 )
 
 var (
@@ -14,7 +14,7 @@ var (
 )
 
 func TestNoRetry(t *testing.T) {
-	v2testing.Current(t)
+	assert := assert.On(t)
 
 	startTime := time.Now().Unix()
 	err := Timed(10, 100000).On(func() error {
@@ -27,7 +27,7 @@ func TestNoRetry(t *testing.T) {
 }
 
 func TestRetryOnce(t *testing.T) {
-	v2testing.Current(t)
+	assert := assert.On(t)
 
 	startTime := time.Now()
 	called := 0
@@ -45,7 +45,7 @@ func TestRetryOnce(t *testing.T) {
 }
 
 func TestRetryMultiple(t *testing.T) {
-	v2testing.Current(t)
+	assert := assert.On(t)
 
 	startTime := time.Now()
 	called := 0
@@ -63,19 +63,31 @@ func TestRetryMultiple(t *testing.T) {
 }
 
 func TestRetryExhausted(t *testing.T) {
-	v2testing.Current(t)
+	assert := assert.On(t)
 
 	startTime := time.Now()
 	called := 0
 	err := Timed(2, 1000).On(func() error {
-		if called < 5 {
-			called++
-			return errorTestOnly
-		}
-		return nil
+		called++
+		return errorTestOnly
 	})
 	duration := time.Since(startTime)
 
-	assert.Error(err).Equals(errorRetryFailed)
+	assert.Error(errors.Cause(err)).Equals(ErrRetryFailed)
 	assert.Int64(int64(duration / time.Millisecond)).AtLeast(1900)
+}
+
+func TestExponentialBackoff(t *testing.T) {
+	assert := assert.On(t)
+
+	startTime := time.Now()
+	called := 0
+	err := ExponentialBackoff(10, 100).On(func() error {
+		called++
+		return errorTestOnly
+	})
+	duration := time.Since(startTime)
+
+	assert.Error(errors.Cause(err)).Equals(ErrRetryFailed)
+	assert.Int64(int64(duration / time.Millisecond)).AtLeast(4000)
 }

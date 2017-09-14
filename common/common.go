@@ -2,16 +2,11 @@
 // See each sub-package for detail.
 package common
 
-import (
-	"errors"
-)
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg common -path Common
 
-var (
-	ErrorAlreadyReleased = errors.New("Object already released.")
-)
-
-// Releasable interface is for those types that can release its members.
-type Releasable interface {
-	// Release releases all references to accelerate garbage collection.
-	Release()
+// Must panics if err is not nil.
+func Must(err error) {
+	if err != nil {
+		panic(err)
+	}
 }

@@ -1,16 +1,16 @@
 package protocol
 
 import (
-	"math/rand"
 	"time"
 
-	"github.com/v2ray/v2ray-core/common/serial"
+	"v2ray.com/core/common/dice"
+	"v2ray.com/core/common/serial"
 )
 
 type Timestamp int64
 
-func (this Timestamp) Bytes() []byte {
-	return serial.Int64Literal(this).Bytes()
+func (v Timestamp) Bytes(b []byte) []byte {
+	return serial.Int64ToBytes(int64(v), b)
 }
 
 type TimestampGenerator func() Timestamp
@@ -21,7 +21,7 @@ func NowTime() Timestamp {
 
 func NewTimestampGenerator(base Timestamp, delta int) TimestampGenerator {
 	return func() Timestamp {
-		rangeInDelta := rand.Intn(delta*2) - delta
+		rangeInDelta := dice.Roll(delta*2) - delta
 		return base + Timestamp(rangeInDelta)
 	}
 }

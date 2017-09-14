@@ -1,222 +1,284 @@
 package inbound
 
-import (
-	"sync"
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg inbound -path Proxy,VMess,Inbound
 
-	"github.com/v2ray/v2ray-core/app"
-	"github.com/v2ray/v2ray-core/app/dispatcher"
-	"github.com/v2ray/v2ray-core/app/proxyman"
-	v2io "github.com/v2ray/v2ray-core/common/io"
-	"github.com/v2ray/v2ray-core/common/log"
-	v2net "github.com/v2ray/v2ray-core/common/net"
-	proto "github.com/v2ray/v2ray-core/common/protocol"
-	raw "github.com/v2ray/v2ray-core/common/protocol/raw"
-	"github.com/v2ray/v2ray-core/common/serial"
-	"github.com/v2ray/v2ray-core/common/uuid"
-	"github.com/v2ray/v2ray-core/proxy"
-	"github.com/v2ray/v2ray-core/proxy/internal"
-	vmessio "github.com/v2ray/v2ray-core/proxy/vmess/io"
-	"github.com/v2ray/v2ray-core/transport/hub"
+import (
+	"context"
+	"io"
+	"runtime"
+	"sync"
+	"time"
+
+	"v2ray.com/core/app"
+	"v2ray.com/core/app/dispatcher"
+	"v2ray.com/core/app/log"
+	"v2ray.com/core/app/proxyman"
+	"v2ray.com/core/common"
+	"v2ray.com/core/common/buf"
+	"v2ray.com/core/common/errors"
+	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/protocol"
+	"v2ray.com/core/common/serial"
+	"v2ray.com/core/common/signal"
+	"v2ray.com/core/common/uuid"
+	"v2ray.com/core/proxy/vmess"
+	"v2ray.com/core/proxy/vmess/encoding"
+	"v2ray.com/core/transport/internet"
+	"v2ray.com/core/transport/ray"
 )
 
 type userByEmail struct {
 	sync.RWMutex
-	cache           map[string]*proto.User
-	defaultLevel    proto.UserLevel
+	cache           map[string]*protocol.User
+	defaultLevel    uint32
 	defaultAlterIDs uint16
 }
 
-func NewUserByEmail(users []*proto.User, config *DefaultConfig) *userByEmail {
-	cache := make(map[string]*proto.User)
+func NewUserByEmail(users []*protocol.User, config *DefaultConfig) *userByEmail {
+	cache := make(map[string]*protocol.User)
 	for _, user := range users {
 		cache[user.Email] = user
 	}
 	return &userByEmail{
 		cache:           cache,
 		defaultLevel:    config.Level,
-		defaultAlterIDs: config.AlterIDs,
+		defaultAlterIDs: uint16(config.AlterId),
 	}
 }
 
-func (this *userByEmail) Get(email string) (*proto.User, bool) {
-	var user *proto.User
+func (v *userByEmail) Get(email string) (*protocol.User, bool) {
+	var user *protocol.User
 	var found bool
-	this.RLock()
-	user, found = this.cache[email]
-	this.RUnlock()
+	v.RLock()
+	user, found = v.cache[email]
+	v.RUnlock()
 	if !found {
-		this.Lock()
-		user, found = this.cache[email]
+		v.Lock()
+		user, found = v.cache[email]
 		if !found {
-			id := proto.NewID(uuid.New())
-			user = proto.NewUser(id, this.defaultLevel, this.defaultAlterIDs, email)
-			this.cache[email] = user
+			account := &vmess.Account{
+				Id:      uuid.New().String(),
+				AlterId: uint32(v.defaultAlterIDs),
+			}
+			user = &protocol.User{
+				Level:   v.defaultLevel,
+				Email:   email,
+				Account: serial.ToTypedMessage(account),
+			}
+			v.cache[email] = user
 		}
-		this.Unlock()
+		v.Unlock()
 	}
 	return user, found
 }
 
-// Inbound connection handler that handles messages in VMess format.
-type VMessInboundHandler struct {
-	sync.Mutex
-	packetDispatcher      dispatcher.PacketDispatcher
+// Handler is an inbound connection handler that handles messages in VMess protocol.
+type Handler struct {
 	inboundHandlerManager proxyman.InboundHandlerManager
-	clients               proto.UserValidator
+	clients               protocol.UserValidator
 	usersByEmail          *userByEmail
-	accepting             bool
-	listener              *hub.TCPHub
-	features              *FeaturesConfig
-	listeningPort         v2net.Port
+	detours               *DetourConfig
+	sessionHistory        *encoding.SessionHistory
 }
 
-func (this *VMessInboundHandler) Port() v2net.Port {
-	return this.listeningPort
+func New(ctx context.Context, config *Config) (*Handler, error) {
+	space := app.SpaceFromContext(ctx)
+	if space == nil {
+		return nil, newError("no space in context")
+	}
+
+	allowedClients := vmess.NewTimedUserValidator(ctx, protocol.DefaultIDHash)
+	for _, user := range config.User {
+		if err := allowedClients.Add(user); err != nil {
+			return nil, newError("failed to initiate user").Base(err)
+		}
+	}
+
+	handler := &Handler{
+		clients:        allowedClients,
+		detours:        config.Detour,
+		usersByEmail:   NewUserByEmail(config.User, config.GetDefaultValue()),
+		sessionHistory: encoding.NewSessionHistory(ctx),
+	}
+
+	space.OnInitialize(func() error {
+		handler.inboundHandlerManager = proxyman.InboundHandlerManagerFromSpace(space)
+		if handler.inboundHandlerManager == nil {
+			return newError("InboundHandlerManager is not found is space")
+		}
+		return nil
+	})
+
+	return handler, nil
 }
 
-func (this *VMessInboundHandler) Close() {
-	this.accepting = false
-	if this.listener != nil {
-		this.Lock()
-		this.listener.Close()
-		this.listener = nil
-		this.Unlock()
+// Network implements proxy.Inbound.Network().
+func (*Handler) Network() net.NetworkList {
+	return net.NetworkList{
+		Network: []net.Network{net.Network_TCP},
 	}
 }
 
-func (this *VMessInboundHandler) GetUser(email string) *proto.User {
-	user, existing := this.usersByEmail.Get(email)
+func (v *Handler) GetUser(email string) *protocol.User {
+	user, existing := v.usersByEmail.Get(email)
 	if !existing {
-		this.clients.Add(user)
+		v.clients.Add(user)
 	}
 	return user
 }
 
-func (this *VMessInboundHandler) Listen(port v2net.Port) error {
-	if this.accepting {
-		if this.listeningPort == port {
-			return nil
-		} else {
-			return proxy.ErrorAlreadyListening
-		}
-	}
-	this.listeningPort = port
+func transferRequest(timer signal.ActivityTimer, session *encoding.ServerSession, request *protocol.RequestHeader, input io.Reader, output ray.OutputStream) error {
+	defer output.Close()
 
-	tcpListener, err := hub.ListenTCP(port, this.HandleConnection)
-	if err != nil {
-		log.Error("Unable to listen tcp port ", port, ": ", err)
+	bodyReader := session.DecodeRequestBody(request, input)
+	if err := buf.Copy(bodyReader, output, buf.UpdateActivity(timer)); err != nil {
 		return err
 	}
-	this.accepting = true
-	this.Lock()
-	this.listener = tcpListener
-	this.Unlock()
 	return nil
 }
 
-func (this *VMessInboundHandler) HandleConnection(connection *hub.TCPConn) {
-	defer connection.Close()
+func transferResponse(timer signal.ActivityTimer, session *encoding.ServerSession, request *protocol.RequestHeader, response *protocol.ResponseHeader, input buf.Reader, output io.Writer) error {
+	session.EncodeResponseHeader(response, output)
 
-	connReader := v2net.NewTimeOutReader(16, connection)
-	defer connReader.Release()
-
-	reader := v2io.NewBufferedReader(connReader)
-	defer reader.Release()
-
-	session := raw.NewServerSession(this.clients)
-
-	request, err := session.DecodeRequestHeader(reader)
-	if err != nil {
-		log.Access(connection.RemoteAddr(), serial.StringLiteral(""), log.AccessRejected, serial.StringLiteral(err.Error()))
-		log.Warning("VMessIn: Invalid request from ", connection.RemoteAddr(), ": ", err)
-		return
-	}
-	log.Access(connection.RemoteAddr(), request.Destination(), log.AccessAccepted, serial.StringLiteral(""))
-	log.Debug("VMessIn: Received request for ", request.Destination())
-
-	ray := this.packetDispatcher.DispatchToOutbound(v2net.NewPacket(request.Destination(), nil, true))
-	input := ray.InboundInput()
-	output := ray.InboundOutput()
-	var readFinish, writeFinish sync.Mutex
-	readFinish.Lock()
-	writeFinish.Lock()
-
-	userSettings := proto.GetUserSettings(request.User.Level)
-	connReader.SetTimeOut(userSettings.PayloadReadTimeout)
-	reader.SetCached(false)
-	go func() {
-		defer close(input)
-		defer readFinish.Unlock()
-		bodyReader := session.DecodeRequestBody(reader)
-		var requestReader v2io.ReleasableReader
-		if request.Option.IsChunkStream() {
-			requestReader = vmessio.NewAuthChunkReader(bodyReader)
-		} else {
-			requestReader = v2io.NewAdaptiveReader(bodyReader)
-		}
-		v2io.ReaderToChan(input, requestReader)
-		requestReader.Release()
-	}()
-
-	writer := v2io.NewBufferedWriter(connection)
-	defer writer.Release()
-
-	response := &proto.ResponseHeader{
-		Command: this.generateCommand(request),
-	}
-
-	session.EncodeResponseHeader(response, writer)
-
-	bodyWriter := session.EncodeResponseBody(writer)
+	bodyWriter := session.EncodeResponseBody(request, output)
 
 	// Optimize for small response packet
-	if data, open := <-output; open {
-		if request.Option.IsChunkStream() {
-			vmessio.Authenticate(data)
-		}
-		bodyWriter.Write(data.Value)
-		data.Release()
-
-		writer.SetCached(false)
-		go func(finish *sync.Mutex) {
-			var writer v2io.Writer = v2io.NewAdaptiveWriter(bodyWriter)
-			if request.Option.IsChunkStream() {
-				writer = vmessio.NewAuthChunkWriter(writer)
-			}
-			v2io.ChanToWriter(writer, output)
-			finish.Unlock()
-		}(&writeFinish)
-		writeFinish.Lock()
+	data, err := input.Read()
+	if err != nil {
+		return err
 	}
 
-	connection.CloseWrite()
-	readFinish.Lock()
+	if err := bodyWriter.Write(data); err != nil {
+		return err
+	}
+	data.Release()
+
+	if bufferedWriter, ok := output.(*buf.BufferedWriter); ok {
+		if err := bufferedWriter.SetBuffered(false); err != nil {
+			return err
+		}
+	}
+
+	if err := buf.Copy(input, bodyWriter, buf.UpdateActivity(timer)); err != nil {
+		return err
+	}
+
+	if request.Option.Has(protocol.RequestOptionChunkStream) {
+		if err := bodyWriter.Write(buf.NewMultiBuffer()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Process implements proxy.Inbound.Process().
+func (v *Handler) Process(ctx context.Context, network net.Network, connection internet.Connection, dispatcher dispatcher.Interface) error {
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second * 8)); err != nil {
+		return err
+	}
+
+	reader := buf.NewBufferedReader(connection)
+
+	session := encoding.NewServerSession(v.clients, v.sessionHistory)
+	request, err := session.DecodeRequestHeader(reader)
+
+	if err != nil {
+		if errors.Cause(err) != io.EOF {
+			log.Access(connection.RemoteAddr(), "", log.AccessRejected, err)
+			log.Trace(newError("invalid request from ", connection.RemoteAddr(), ": ", err).AtInfo())
+		}
+		return err
+	}
+
+	if request.Command == protocol.RequestCommandMux {
+		request.Address = net.DomainAddress("v1.mux.com")
+		request.Port = net.Port(0)
+	}
+
+	log.Access(connection.RemoteAddr(), request.Destination(), log.AccessAccepted, "")
+	log.Trace(newError("received request for ", request.Destination()))
+
+	common.Must(connection.SetReadDeadline(time.Time{}))
+
+	userSettings := request.User.GetSettings()
+
+	ctx = protocol.ContextWithUser(ctx, request.User)
+
+	ctx, timer := signal.CancelAfterInactivity(ctx, userSettings.PayloadTimeout)
+	ray, err := dispatcher.Dispatch(ctx, request.Destination())
+	if err != nil {
+		return newError("failed to dispatch request to ", request.Destination()).Base(err)
+	}
+
+	input := ray.InboundInput()
+	output := ray.InboundOutput()
+
+	reader.SetBuffered(false)
+
+	requestDone := signal.ExecuteAsync(func() error {
+		return transferRequest(timer, session, request, reader, input)
+	})
+
+	responseDone := signal.ExecuteAsync(func() error {
+		writer := buf.NewBufferedWriter(connection)
+		defer writer.Flush()
+
+		response := &protocol.ResponseHeader{
+			Command: v.generateCommand(ctx, request),
+		}
+		return transferResponse(timer, session, request, response, output, writer)
+	})
+
+	if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		input.CloseError()
+		output.CloseError()
+		return newError("connection ends").Base(err)
+	}
+
+	runtime.KeepAlive(timer)
+
+	return nil
+}
+
+func (v *Handler) generateCommand(ctx context.Context, request *protocol.RequestHeader) protocol.ResponseCommand {
+	if v.detours != nil {
+		tag := v.detours.To
+		if v.inboundHandlerManager != nil {
+			handler, err := v.inboundHandlerManager.GetHandler(ctx, tag)
+			if err != nil {
+				log.Trace(newError("failed to get detour handler: ", tag, err).AtWarning())
+				return nil
+			}
+			proxyHandler, port, availableMin := handler.GetRandomInboundProxy()
+			inboundHandler, ok := proxyHandler.(*Handler)
+			if ok && inboundHandler != nil {
+				if availableMin > 255 {
+					availableMin = 255
+				}
+
+				log.Trace(newError("pick detour handler for port ", port, " for ", availableMin, " minutes.").AtDebug())
+				user := inboundHandler.GetUser(request.User.Email)
+				if user == nil {
+					return nil
+				}
+				account, _ := user.GetTypedAccount()
+				return &protocol.CommandSwitchAccount{
+					Port:     port,
+					ID:       account.(*vmess.InternalAccount).ID.UUID(),
+					AlterIds: uint16(len(account.(*vmess.InternalAccount).AlterIDs)),
+					Level:    user.Level,
+					ValidMin: byte(availableMin),
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func init() {
-	internal.MustRegisterInboundHandlerCreator("vmess",
-		func(space app.Space, rawConfig interface{}) (proxy.InboundHandler, error) {
-			if !space.HasApp(dispatcher.APP_ID) {
-				return nil, internal.ErrorBadConfiguration
-			}
-			config := rawConfig.(*Config)
-
-			allowedClients := proto.NewTimedUserValidator(proto.DefaultIDHash)
-			for _, user := range config.AllowedUsers {
-				allowedClients.Add(user)
-			}
-
-			handler := &VMessInboundHandler{
-				packetDispatcher: space.GetApp(dispatcher.APP_ID).(dispatcher.PacketDispatcher),
-				clients:          allowedClients,
-				features:         config.Features,
-				usersByEmail:     NewUserByEmail(config.AllowedUsers, config.Defaults),
-			}
-
-			if space.HasApp(proxyman.APP_ID_INBOUND_MANAGER) {
-				handler.inboundHandlerManager = space.GetApp(proxyman.APP_ID_INBOUND_MANAGER).(proxyman.InboundHandlerManager)
-			}
-
-			return handler, nil
-		})
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return New(ctx, config.(*Config))
+	}))
 }

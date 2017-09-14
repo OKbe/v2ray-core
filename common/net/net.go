@@ -1,2 +1,4 @@
 // Package net contains common network utilities.
-package net // import "github.com/v2ray/v2ray-core/common/net"
+package net
+
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg net -path Net

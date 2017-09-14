@@ -3,18 +3,13 @@ package protocol
 import (
 	"crypto/hmac"
 	"crypto/md5"
-	"errors"
 	"hash"
 
-	"github.com/v2ray/v2ray-core/common/uuid"
+	"v2ray.com/core/common/uuid"
 )
 
 const (
 	IDBytesLen = 16
-)
-
-var (
-	InvalidID = errors.New("Invalid ID.")
 )
 
 type IDHash func(key []byte) hash.Hash
@@ -29,20 +24,21 @@ type ID struct {
 	cmdKey [IDBytesLen]byte
 }
 
-func (this *ID) Equals(another *ID) bool {
-	return this.uuid.Equals(another.uuid)
+// Equals returns true if this ID equals to the other one.
+func (v *ID) Equals(another *ID) bool {
+	return v.uuid.Equals(another.uuid)
 }
 
-func (this *ID) Bytes() []byte {
-	return this.uuid.Bytes()
+func (v *ID) Bytes() []byte {
+	return v.uuid.Bytes()
 }
 
-func (this *ID) String() string {
-	return this.uuid.String()
+func (v *ID) String() string {
+	return v.uuid.String()
 }
 
-func (this *ID) UUID() *uuid.UUID {
-	return this.uuid
+func (v *ID) UUID() *uuid.UUID {
+	return v.uuid
 }
 
 func (v ID) CmdKey() []byte {
@@ -56,4 +52,16 @@ func NewID(uuid *uuid.UUID) *ID {
 	md5hash.Write([]byte("c48619fe-8f02-49e0-b9e9-edf763e17e21"))
 	md5hash.Sum(id.cmdKey[:0])
 	return id
+}
+
+func NewAlterIDs(primary *ID, alterIDCount uint16) []*ID {
+	alterIDs := make([]*ID, alterIDCount)
+	prevID := primary.UUID()
+	for idx := range alterIDs {
+		newid := prevID.Next()
+		// TODO: check duplicates
+		alterIDs[idx] = NewID(newid)
+		prevID = newid
+	}
+	return alterIDs
 }
